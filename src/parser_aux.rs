@@ -335,7 +335,8 @@ impl Document {
             .collect::<Result<BTreeMap<Vec<u8>, Encoding>>>()?;
         let content_data = self.get_page_content(page_id);
         let mut content = Content::decode(&content_data)?;
-        let mut current_encoding = None;
+        let mut current_font = None;
+        let mut current_font_operands = None;
         let mut replacement_counts = vec![0; replacements.len()];
         let mut ordered_replacements = replacements
             .iter()
@@ -344,32 +345,81 @@ impl Document {
             .collect::<Vec<_>>();
         ordered_replacements.sort_by_key(|(_, search_text, _)| Reverse(search_text.len()));
 
-        for operation in &mut content.operations {
+        let mut operations = Vec::with_capacity(content.operations.len());
+        for mut operation in std::mem::take(&mut content.operations) {
             match operation.operator.as_ref() {
                 "Tf" => {
-                    let current_font = operation
+                    let font_name = operation
                         .operands
                         .first()
                         .ok_or_else(|| Error::Syntax("missing font operand".to_string()))?
-                        .as_name()?;
-                    current_encoding = encodings.get(current_font);
+                        .as_name()?
+                        .to_vec();
+                    current_font_operands = Some(operation.operands.clone());
+                    current_font = Some(font_name);
+                    operations.push(operation);
                 }
                 "Tj" | "TJ" => {
-                    if let Some(encoding) = current_encoding {
-                        replace_partials_in_operation(
-                            operation,
-                            encoding,
-                            &ordered_replacements,
-                            default_char.unwrap_or("?"),
-                            &mut replacement_counts,
-                        )?;
-                    } else {
+                    let Some(font_name) = current_font.as_deref() else {
                         warn!("No encoding found for text operation");
+                        operations.push(operation);
+                        continue;
+                    };
+                    let Some(encoding) = encodings.get(font_name) else {
+                        warn!("No encoding found for text operation");
+                        operations.push(operation);
+                        continue;
+                    };
+                    let output_font =
+                        if replacements_fit_encoding(&operation, encoding, encoding, &ordered_replacements)? {
+                            font_name
+                        } else {
+                            let mut fallback_font = None;
+                            for (candidate_name, candidate_encoding) in &encodings {
+                                if replacements_fit_encoding(
+                                    &operation,
+                                    encoding,
+                                    candidate_encoding,
+                                    &ordered_replacements,
+                                )? {
+                                    fallback_font = Some(candidate_name.as_slice());
+                                    break;
+                                }
+                            }
+                            fallback_font.ok_or(Error::CharacterEncoding)?
+                        };
+                    let output_encoding = encodings.get(output_font).ok_or(Error::CharacterEncoding)?;
+                    let counts_before = replacement_counts.clone();
+                    replace_partials_in_operation(
+                        &mut operation,
+                        encoding,
+                        output_encoding,
+                        &ordered_replacements,
+                        default_char.unwrap_or("?"),
+                        &mut replacement_counts,
+                    )?;
+                    let changed = counts_before != replacement_counts;
+                    if changed && output_font != font_name {
+                        let mut fallback_operands = current_font_operands
+                            .clone()
+                            .ok_or_else(|| Error::Syntax("missing font operands".to_string()))?;
+                        fallback_operands[0] = Name(output_font.to_vec());
+                        operations.push(Operation::new("Tf", fallback_operands));
+                        operations.push(operation);
+                        operations.push(Operation::new(
+                            "Tf",
+                            current_font_operands
+                                .clone()
+                                .ok_or_else(|| Error::Syntax("missing font operands".to_string()))?,
+                        ));
+                    } else {
+                        operations.push(operation);
                     }
                 }
-                _ => {}
+                _ => operations.push(operation),
             }
         }
+        content.operations = operations;
 
         if replacement_counts.iter().any(|&count| count > 0) {
             let modified_content = content.encode()?;
@@ -580,13 +630,13 @@ fn replace_partial_in_array(
 }
 
 fn replace_partials_in_operation(
-    operation: &mut Operation, encoding: &Encoding, replacements: &[(usize, &str, &str)], default_char: &str,
-    replacement_counts: &mut [usize],
+    operation: &mut Operation, decoding: &Encoding, encoding: &Encoding, replacements: &[(usize, &str, &str)],
+    default_char: &str, replacement_counts: &mut [usize],
 ) -> Result<()> {
     for operand in &mut operation.operands {
         match operand {
             Object::String(bytes, _) => {
-                let decoded_text = Document::decode_text(encoding, bytes)?;
+                let decoded_text = Document::decode_text(decoding, bytes)?;
                 let replaced_text = replace_simultaneously(&decoded_text, replacements, replacement_counts);
                 if replaced_text != decoded_text {
                     *bytes = encode_with_fallback(encoding, &replaced_text, default_char);
@@ -594,7 +644,7 @@ fn replace_partials_in_operation(
             }
             Object::Array(arr) => {
                 let mut decoded_text = String::new();
-                collect_text(&mut decoded_text, encoding, arr)?;
+                collect_text(&mut decoded_text, decoding, arr)?;
                 let replaced_text = replace_simultaneously(&decoded_text, replacements, replacement_counts);
                 if replaced_text != decoded_text {
                     let encoded_text = encode_with_fallback(encoding, &replaced_text, default_char);
@@ -616,6 +666,34 @@ fn replace_partials_in_operation(
     }
 
     Ok(())
+}
+
+fn replacements_fit_encoding(
+    operation: &Operation, decoding: &Encoding, encoding: &Encoding, replacements: &[(usize, &str, &str)],
+) -> Result<bool> {
+    for operand in &operation.operands {
+        let decoded_text = match operand {
+            Object::String(bytes, _) => Document::decode_text(decoding, bytes)?,
+            Object::Array(arr) => {
+                let mut text = String::new();
+                collect_text(&mut text, decoding, arr)?;
+                text
+            }
+            _ => continue,
+        };
+        let mut replacement_counts = vec![0; replacements.len()];
+        let replaced_text = replace_simultaneously(&decoded_text, replacements, &mut replacement_counts);
+        if replaced_text != decoded_text && !text_round_trips(encoding, &replaced_text)? {
+            return Ok(false);
+        }
+    }
+
+    Ok(true)
+}
+
+fn text_round_trips(encoding: &Encoding, text: &str) -> Result<bool> {
+    let encoded = Document::encode_text(encoding, text);
+    Ok(Document::decode_text(encoding, &encoded)? == text)
 }
 
 fn replace_simultaneously(
