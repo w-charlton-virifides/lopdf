@@ -11,6 +11,7 @@ use crate::{
     xref::{Xref, XrefEntry, XrefType},
 };
 use std::{
+    cmp::Reverse,
     collections::BTreeMap,
     io::{Cursor, Read},
 };
@@ -315,6 +316,69 @@ impl Document {
         Ok(replacement_count)
     }
 
+    pub fn replace_partial_texts(
+        &mut self, page_number: u32, replacements: &[(&str, &str)], default_char: Option<&str>,
+    ) -> Result<Vec<usize>> {
+        if replacements.iter().any(|(search_text, _)| search_text.is_empty()) {
+            return Err(Error::Syntax("replacement search text cannot be empty".to_string()));
+        }
+
+        let page = page_number.saturating_sub(1) as usize;
+        let page_id = self
+            .page_iter()
+            .nth(page)
+            .ok_or(Error::PageNumberNotFound(page_number))?;
+        let encodings: BTreeMap<Vec<u8>, Encoding> = self
+            .get_page_fonts(page_id)?
+            .into_iter()
+            .map(|(name, font)| font.get_font_encoding(self).map(|it| (name, it)))
+            .collect::<Result<BTreeMap<Vec<u8>, Encoding>>>()?;
+        let content_data = self.get_page_content(page_id);
+        let mut content = Content::decode(&content_data)?;
+        let mut current_encoding = None;
+        let mut replacement_counts = vec![0; replacements.len()];
+        let mut ordered_replacements = replacements
+            .iter()
+            .enumerate()
+            .map(|(index, &(search_text, replacement_text))| (index, search_text, replacement_text))
+            .collect::<Vec<_>>();
+        ordered_replacements.sort_by_key(|(_, search_text, _)| Reverse(search_text.len()));
+
+        for operation in &mut content.operations {
+            match operation.operator.as_ref() {
+                "Tf" => {
+                    let current_font = operation
+                        .operands
+                        .first()
+                        .ok_or_else(|| Error::Syntax("missing font operand".to_string()))?
+                        .as_name()?;
+                    current_encoding = encodings.get(current_font);
+                }
+                "Tj" | "TJ" => {
+                    if let Some(encoding) = current_encoding {
+                        replace_partials_in_operation(
+                            operation,
+                            encoding,
+                            &ordered_replacements,
+                            default_char.unwrap_or("?"),
+                            &mut replacement_counts,
+                        )?;
+                    } else {
+                        warn!("No encoding found for text operation");
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        if replacement_counts.iter().any(|&count| count > 0) {
+            let modified_content = content.encode()?;
+            self.change_page_content(page_id, modified_content)?;
+        }
+
+        Ok(replacement_counts)
+    }
+
     pub fn insert_image(
         &mut self, page_id: ObjectId, img_object: Stream, position: (f32, f32), size: (f32, f32),
     ) -> Result<()> {
@@ -513,6 +577,70 @@ fn replace_partial_in_array(
     }
 
     Ok(replacement_count)
+}
+
+fn replace_partials_in_operation(
+    operation: &mut Operation, encoding: &Encoding, replacements: &[(usize, &str, &str)], default_char: &str,
+    replacement_counts: &mut [usize],
+) -> Result<()> {
+    for operand in &mut operation.operands {
+        match operand {
+            Object::String(bytes, _) => {
+                let decoded_text = Document::decode_text(encoding, bytes)?;
+                let replaced_text = replace_simultaneously(&decoded_text, replacements, replacement_counts);
+                if replaced_text != decoded_text {
+                    *bytes = encode_with_fallback(encoding, &replaced_text, default_char);
+                }
+            }
+            Object::Array(arr) => {
+                let mut decoded_text = String::new();
+                collect_text(&mut decoded_text, encoding, arr)?;
+                let replaced_text = replace_simultaneously(&decoded_text, replacements, replacement_counts);
+                if replaced_text != decoded_text {
+                    let encoded_text = encode_with_fallback(encoding, &replaced_text, default_char);
+                    let mut placed = false;
+                    for item in arr {
+                        if let Object::String(bytes, _) = item {
+                            if placed {
+                                bytes.clear();
+                            } else {
+                                bytes.clone_from(&encoded_text);
+                                placed = true;
+                            }
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    Ok(())
+}
+
+fn replace_simultaneously(
+    text: &str, replacements: &[(usize, &str, &str)], replacement_counts: &mut [usize],
+) -> String {
+    let mut output = String::with_capacity(text.len());
+    let mut offset = 0;
+
+    while offset < text.len() {
+        let remaining = &text[offset..];
+        if let Some(&(index, search_text, replacement_text)) = replacements
+            .iter()
+            .find(|(_, search_text, _)| remaining.starts_with(search_text))
+        {
+            output.push_str(replacement_text);
+            replacement_counts[index] += 1;
+            offset += search_text.len();
+        } else {
+            let character = remaining.chars().next().expect("remaining text is non-empty");
+            output.push(character);
+            offset += character.len_utf8();
+        }
+    }
+
+    output
 }
 
 fn encode_with_fallback(encoding: &Encoding, text: &str, default_char: &str) -> Vec<u8> {

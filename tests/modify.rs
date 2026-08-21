@@ -150,6 +150,30 @@ mod tests_with_parsing {
         assert_eq!(text, "Modified text! \n");
     }
 
+    #[test]
+    fn test_replace_partial_texts_across_tj_array_strings_without_cascading() {
+        let content = b"BT\n/F1 12 Tf\n100 700 Td\n[(old) 0 ( new)] TJ\nET\n".to_vec();
+        let mut doc = build_doc_with_tj_array(content);
+        let counts = doc
+            .replace_partial_texts(1, &[("old", "new"), ("new", "final")], None)
+            .unwrap();
+
+        assert_eq!(counts, vec![1, 1]);
+        assert_eq!(doc.extract_text(&[1]).unwrap(), "new final \n");
+    }
+
+    #[test]
+    fn test_replace_partial_texts_prefers_longer_overlapping_source() {
+        let content = b"BT\n/F1 12 Tf\n100 700 Td\n[(GB333974634000 GB333974634)] TJ\nET\n".to_vec();
+        let mut doc = build_doc_with_tj_array(content);
+        let counts = doc
+            .replace_partial_texts(1, &[("GB333974634", "vat"), ("GB333974634000", "eori")], None)
+            .unwrap();
+
+        assert_eq!(counts, vec![1, 1]);
+        assert_eq!(doc.extract_text(&[1]).unwrap(), "eori vat \n");
+    }
+
     fn get_mut() -> Result<bool> {
         let mut doc = Document::load("assets/example.pdf")?;
         let arr = doc
