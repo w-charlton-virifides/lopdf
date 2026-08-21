@@ -130,7 +130,7 @@ fn cid_system_info(input: ParserInput) -> NomResult<()> {
         tag(&b"/CIDSystemInfo"[..]),
         multispace0,
         alt((dictionary, dict_dup)),
-        multispace1,
+        multispace0,
         tag(&b"def"[..]),
         multispace1,
     )
@@ -1063,6 +1063,33 @@ end
 end\n";
         assert!(cmap_stream(test_span(data)).is_ok())
     }
+    #[test]
+    fn parse_compact_cmap_with_unseparated_cid_system_info() {
+        let data = b"/CIDInit/ProcSet findresource begin
+12 dict begin begincmap
+/CMapName/Adobe-Identity-UCS def
+/CIDSystemInfo<</Registry(Adobe)/Ordering(UCS)/Supplement 0>>def
+/CMapType 2 def
+1 begincodespacerange
+<0000><FFFF>
+endcodespacerange
+2 beginbfchar
+<0001><004D>
+<0002><0041>
+endbfchar
+endcmap
+CMapName currentdict /CMap defineresource pop end end
+";
+
+        assert_eq!(
+            cmap_stream(test_span(data)).unwrap().1,
+            vec![
+                CMapSection::CsRange(vec![(0x0000, 0xffff, 2)]),
+                CMapSection::BfChar(vec![((0x0001, 2), vec![0x004d]), ((0x0002, 2), vec![0x0041])]),
+            ]
+        );
+    }
+
     #[test]
     fn parse_cmap_section_error() {
         let data = b"%!PS-Adobe-3.0 Resource-CMap
